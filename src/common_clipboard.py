@@ -30,7 +30,19 @@ def register(address):
     global server_url
 
     server_url = f'http://{address}:{port}'
-    requests.post(server_url + '/register', json={'name': gethostname()})
+    try:
+        hostname = gethostname()
+        # Clean hostname to avoid issues with special characters and non-ASCII
+        import re
+        # Remove or replace problematic characters
+        hostname = re.sub(r'[^\w\-_.]', '_', hostname)
+        # Limit length and ensure it's not empty
+        if not hostname or len(hostname) > 50:
+            hostname = "Unknown_Device"
+    except OSError:
+        hostname = "Unknown_Device"
+    
+    requests.post(server_url + '/register', json={'name': hostname})
 
 
 def test_server_ip(index):
@@ -38,10 +50,12 @@ def test_server_ip(index):
     global running_server
 
     try:
-        tested_url = f'http://{base_ipaddr}.{index}:{port}'
-        response = requests.get(tested_url + '/timestamp', timeout=5)
+        # Construct IP using our subnet and the provided index
+        tested_ip = f'{split_ipaddr[0]}.{split_ipaddr[1]}.{split_ipaddr[2]}.{index}'
+        tested_url = f'http://{tested_ip}:{port}'
+        response = requests.get(tested_url + '/timestamp', timeout=2)  # Reduced timeout
         if response.ok and float(response.text) < server_timestamp.value:
-            register(base_ipaddr + '.' + index)
+            register(tested_ip)
             running_server = False
             server_process.terminate()
             systray.title = f'{APP_NAME}: Connected'
@@ -50,28 +64,27 @@ def test_server_ip(index):
 
 
 def generate_ips():
-    for i in range(0, 255):
-        for j in range(0, 255):
-            for k in range(0, 255):
-                if i != int(split_ipaddr[1]) or j != int(split_ipaddr[2]) or k != int(split_ipaddr[3]):
-                    test_url_thread = Thread(target=test_server_ip, args=(f'{i}.{j}.{k}',), daemon=True)
-                    test_url_thread.start()
+    # Only scan the local subnet (last octet) to avoid overwhelming the network
+    # This is much more reasonable and won't cause WiFi issues
+    for k in range(1, 255):  # Skip 0 and 255 (network and broadcast)
+        if k != int(split_ipaddr[3]):  # Skip our own IP
+            test_url_thread = Thread(target=test_server_ip, args=(k,), daemon=True)
+            test_url_thread.start()
+            # Add a small delay to prevent overwhelming the network
+            time.sleep(0.01)
 
 
 def find_server():
     global running_server
     global server_url
 
-    try:
-        requests.get(TEST_INTERNET_URL)
-        start_server()
-        register(ipaddr)
-        systray.title = f'{APP_NAME}: Server Running'
+    # Start server without requiring internet connectivity
+    start_server()
+    register(ipaddr)
+    systray.title = f'{APP_NAME}: Server Running'
 
-        generator_thread = Thread(target=generate_ips)
-        generator_thread.start()
-    except requests.exceptions.ConnectionError:
-        server_url = ''
+    generator_thread = Thread(target=generate_ips)
+    generator_thread.start()
 
 
 def get_copied_data():
@@ -129,12 +142,11 @@ def detect_server_change():
 def mainloop():
     while run_app:
         try:
-            requests.get(TEST_INTERNET_URL)
-            detect_server_change()
+            if server_url:  # Only try to detect changes if we have a server URL
+                detect_server_change()
             detect_local_copy()
         except (requests.exceptions.ConnectionError, TimeoutError, OSError) as e:
-            systray.title = f'{APP_NAME}: Not Connected'
-            if run_app:
+            if not server_url:  # Only try to find server if we don't have one
                 find_server()
         finally:
             if running_server:
@@ -195,10 +207,25 @@ if __name__ == '__main__':
 
     APP_NAME = 'Common Clipboard'
     LISTENER_DELAY = 0.3
-    TEST_INTERNET_URL = 'https://8.8.8.8'
 
     server_url = ''
-    ipaddr = gethostbyname(gethostname())
+    try:
+        ipaddr = gethostbyname(gethostname())
+    except (gaierror, OSError):
+        # Fallback: try to get IP from local network interfaces
+        import socket
+        try:
+            # Get local IP without making external connections
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                # Don't actually connect, just bind to get local address
+                s.bind(('', 0))
+                ipaddr = s.getsockname()[0]
+                if ipaddr == '0.0.0.0':
+                    # If we get 0.0.0.0, try a different approach
+                    ipaddr = socket.gethostbyname('localhost')
+        except OSError:
+            # Final fallback: use localhost
+            ipaddr = "127.0.0.1"
     split_ipaddr = [int(num) for num in ipaddr.split('.')]
     base_ipaddr = str(split_ipaddr[0])
 
@@ -231,7 +258,26 @@ if __name__ == '__main__':
     format_to_type = {Format.TEXT: 'text', Format.IMAGE: 'image'}
     type_to_format = {v: k for k, v in format_to_type.items()}
 
-    icon = Image.open('systray_icon.ico')
+    # Handle icon path for both development and PyInstaller executable
+    try:
+        # Try to find the icon file in the current directory
+        icon_path = 'systray_icon.ico'
+        if not os.path.exists(icon_path):
+            # If not found, try to get it from PyInstaller's temp directory
+            if getattr(sys, 'frozen', False):
+                # Running as PyInstaller executable
+                base_path = sys._MEIPASS
+                icon_path = os.path.join(base_path, 'systray_icon.ico')
+            else:
+                # Running as script, try relative to script location
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                icon_path = os.path.join(script_dir, 'systray_icon.ico')
+        
+        icon = Image.open(icon_path)
+    except (FileNotFoundError, OSError):
+        # Fallback: create a simple default icon
+        icon = Image.new('RGBA', (64, 64), (100, 100, 100, 255))
+    
     systray = Icon(APP_NAME, icon=icon, title=APP_NAME, menu=Menu(get_menu_items))
     systray.run_detached()
 
