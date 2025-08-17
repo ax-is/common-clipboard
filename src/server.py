@@ -6,7 +6,6 @@ import time
 import ntplib
 from flask import Flask, request, make_response, send_file
 from io import BytesIO
-from multiprocessing import Value
 from device_list import DeviceList
 
 app = Flask(__name__)
@@ -16,7 +15,7 @@ app = Flask(__name__)
 
 @app.route('/timestamp', methods=['GET'])
 def get_timestamp():
-    return str(timestamp.value), 200
+    return str(timestamp), 200
 
 
 
@@ -73,21 +72,20 @@ def update_clipboard():
         return str(e), 400
 
 
-def run_server(port, device_list, t):
+def run_server(port, device_list, _unused_timestamp=None):
     global timestamp
     global connected_devices
 
     try:
         response = ntp_client.request('us.pool.ntp.org', version=3, timeout=5)
-        t.value = response.tx_timestamp
+        timestamp = response.tx_timestamp
     except Exception as e:
         print(f"Warning: Could not get NTP timestamp: {e}")
-        t.value = time.time()
-    
-    timestamp = t
+        timestamp = time.time()
+
     connected_devices = device_list
-    
-    app.run(host='0.0.0.0', port=port)
+
+    app.run(host='0.0.0.0', port=port, threaded=True, use_reloader=False)
 
 
 unregistered_error = 'The requesting device is not registered to the server', 401
@@ -95,5 +93,15 @@ unregistered_error = 'The requesting device is not registered to the server', 40
 ntp_client = ntplib.NTPClient()
 clipboard = b''
 data_type = 'text'
-timestamp = Value('d')
+timestamp = 0.0
 connected_devices = DeviceList()
+
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    """Gracefully stop the Flask development server."""
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        return 'Not running with the Werkzeug Server', 500
+    func()
+    return '', 204

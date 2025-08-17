@@ -2,19 +2,14 @@
 Simple port editor dialog
 """
 
-import tkinter as tk
-from tkinter import simpledialog
-
-def edit_port(current_port=5000):
-    """
-    Minimal popup dialog to edit the port. Returns int or None.
-    """
+def _ask_port(current_port: int):
+    import tkinter as tk
+    from tkinter import simpledialog
     root = tk.Tk()
     root.withdraw()
     try:
-        # Keep it simple but ensure it appears on top briefly
         root.attributes('-topmost', True)
-        new_port = simpledialog.askinteger(
+        return simpledialog.askinteger(
             "Port Editor",
             f"Current port: {current_port}\n\nEnter new port (1024-65535):",
             parent=root,
@@ -22,14 +17,20 @@ def edit_port(current_port=5000):
             maxvalue=65535,
             initialvalue=current_port
         )
-        return new_port
-    except Exception:
-        return None
     finally:
         try:
             root.destroy()
         except:
             pass
+
+def edit_port(current_port=5000):
+    """
+    Minimal popup dialog to edit the port. Returns int or None.
+    """
+    try:
+        return _ask_port(current_port)
+    except Exception:
+        return None
 
 
 class PortEditor:

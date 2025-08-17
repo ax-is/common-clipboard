@@ -13,9 +13,9 @@ import socket
 import threading
 import msvcrt
 from socket import gethostbyname, gethostname, gaierror
+from concurrent.futures import ThreadPoolExecutor
 from threading import Thread
-from multiprocessing import freeze_support, Value, Process
-from multiprocessing.managers import BaseManager
+from multiprocessing import freeze_support
 from enum import Enum
 from pystray import Icon, Menu, MenuItem
 from PIL import Image
@@ -31,6 +31,10 @@ class Format(Enum):
 
 # Connection state management
 connection_lock = threading.Lock()
+# Guards and shared client
+scan_in_progress = threading.Event()
+port_dialog_open = threading.Event()
+http = requests.Session()
 
 # Global variables for single instance control
 instance_lock = None
@@ -63,7 +67,7 @@ def register(address):
     except OSError:
         hostname = "Unknown_Device"
     
-    requests.post(server_url + '/register', json={'name': hostname})
+    http.post(server_url + '/register', json={'name': hostname})
 
 
 def test_server_ip(index):
@@ -77,18 +81,12 @@ def test_server_ip(index):
         
         # Test timestamp endpoint (original repository method)
         try:
-            response = requests.get(tested_url + '/timestamp', timeout=2)
-            if response.ok and float(response.text) < server_timestamp.value:
+            response = http.get(tested_url + '/timestamp', timeout=2)
+            if response.ok and float(response.text) < server_timestamp:
                 server_url = tested_url
                 register(tested_ip)
                 running_server = False
-                try:
-                    server_process.terminate()
-                    server_process.join(timeout=2)
-                    if server_process.is_alive():
-                        server_process.kill()
-                except Exception as e:
-                    print(f"Error terminating server process: {e}")
+                # No child process now; server runs in-thread
                 systray.title = f'{APP_NAME}: Connected'
         except (ValueError, requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
             # Silently ignore connection errors during discovery
@@ -100,14 +98,19 @@ def test_server_ip(index):
 
 
 def generate_ips():
-    # Only scan the local subnet (last octet) to avoid overwhelming the network
-    # This is much more reasonable and won't cause WiFi issues
-    for k in range(1, 255):  # Skip 0 and 255 (network and broadcast)
-        if k != int(split_ipaddr[3]):  # Skip our own IP
-            test_url_thread = Thread(target=test_server_ip, args=(k,), daemon=True)
-            test_url_thread.start()
-            # Add a small delay to prevent overwhelming the network
-            time.sleep(0.01)
+    # Bounded concurrency scan to reduce Wi‑Fi/CPU pressure
+    if scan_in_progress.is_set():
+        return
+    scan_in_progress.set()
+    try:
+        max_workers = 16
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for k in range(1, 255):  # 1..254
+                if k == int(split_ipaddr[3]):
+                    continue
+                pool.submit(test_server_ip, k)
+    finally:
+        scan_in_progress.clear()
 
 
 def find_server():
@@ -116,10 +119,19 @@ def find_server():
 
     # Start server without requiring internet connectivity
     start_server()
+    # Wait briefly until the local server is listening to avoid race on first register()
+    start_ts = time.time()
+    while time.time() - start_ts < 2.0:
+        try:
+            resp = http.get(f'http://127.0.0.1:{port}/timestamp', timeout=0.3)
+            if resp.ok:
+                break
+        except Exception:
+            time.sleep(0.1)
     register(ipaddr)
     systray.title = f'{APP_NAME}: Server Running'
 
-    generator_thread = Thread(target=generate_ips)
+    generator_thread = Thread(target=generate_ips, daemon=True)
     generator_thread.start()
 
 
@@ -158,7 +170,7 @@ def detect_local_copy():
                 file = BytesIO()
                 file.write(current_data.encode() if current_format == Format.TEXT else current_data)
                 file.seek(0)
-                response = requests.post(server_url + '/clipboard', data=file, headers={'Data-Type': format_to_type[current_format]}, timeout=5)
+                response = http.post(server_url + '/clipboard', data=file, headers={'Data-Type': format_to_type[current_format]}, timeout=5)
                 if not response.ok:
                     print(f"Failed to send clipboard data: {response.status_code}")
             except Exception as e:
@@ -180,9 +192,9 @@ def detect_server_change():
             return
 
         try:
-            headers = requests.head(server_url + '/clipboard', timeout=3)
+            headers = http.head(server_url + '/clipboard', timeout=3)
             if headers.ok and headers.headers.get('Data-Attached') == 'True':
-                data_request = requests.get(server_url + '/clipboard', timeout=5)
+                data_request = http.get(server_url + '/clipboard', timeout=5)
                 if data_request.ok:
                     data_format = type_to_format[data_request.headers['Data-Type']]
                     data = data_request.content.decode() if data_format == Format.TEXT else data_request.content
@@ -220,23 +232,25 @@ def mainloop():
 
 def start_server():
     global running_server
-    global server_process
+    global server_thread
 
-    if server_process is not None:
+    if server_thread is not None and server_thread.is_alive():
         try:
-            server_process.terminate()
-            server_process.join(timeout=3)
-            if server_process.is_alive():
-                server_process.kill()
-        except Exception as e:
-            print(f"Error terminating server process: {e}")
-        finally:
-            server_process = None
+            http.post(f'http://127.0.0.1:{port}/shutdown', timeout=2)
+        except Exception:
+            pass
+        server_thread.join(timeout=3)
 
     connected_devices.clear()
     running_server = True
-    server_process = Process(target=run_server, args=(port, connected_devices, server_timestamp,))
-    server_process.start()
+
+    # Launch Flask in a background thread
+    def _run():
+        from server import run_server
+        run_server(port, connected_devices, server_timestamp)
+
+    server_thread = Thread(target=_run, daemon=True)
+    server_thread.start()
 
 
 def close():
@@ -245,14 +259,12 @@ def close():
     run_app = False
     
     # Clean up server process
-    if server_process is not None:
+    if server_thread is not None and server_thread.is_alive():
         try:
-            server_process.terminate()
-            server_process.join(timeout=3)
-            if server_process.is_alive():
-                server_process.kill()
-        except Exception as e:
-            print(f"Error terminating server process: {e}")
+            http.post(f'http://127.0.0.1:{port}/shutdown', timeout=2)
+        except Exception:
+            pass
+        server_thread.join(timeout=3)
 
     # Save preferences
     try:
@@ -275,26 +287,23 @@ def close():
 def toggle_server():
     """Toggle server on/off"""
     global running_server
-    global server_process
+    global server_thread
     global server_url
     
     if running_server:
         # Stop server
-        if server_process is not None:
+        if server_thread is not None and server_thread.is_alive():
             try:
-                server_process.terminate()
-                server_process.join(timeout=3)
-                if server_process.is_alive():
-                    server_process.kill()
+                http.post(f'http://127.0.0.1:{port}/shutdown', timeout=2)
             except Exception as e:
                 print(f"Error stopping server: {e}")
-            finally:
-                server_process = None
-                running_server = False
-                server_url = ''
-                connected_devices.clear()
-                print("Server stopped")
-                systray.title = f'{APP_NAME}: Stopped'
+            server_thread.join(timeout=3)
+            server_thread = None
+            running_server = False
+            server_url = ''
+            connected_devices.clear()
+            print("Server stopped")
+            systray.title = f'{APP_NAME}: Stopped'
     else:
         # Start server
         find_server()
@@ -303,7 +312,7 @@ def toggle_server():
 def edit_port():
     global port
     global running_server
-    global server_process
+    global server_thread
 
     # Prevent multiple dialogs
     if port_dialog_open.is_set():
@@ -311,17 +320,14 @@ def edit_port():
     port_dialog_open.set()
     try:
         # Stop the server first
-        if server_process is not None:
+        if server_thread is not None and server_thread.is_alive():
             try:
-                server_process.terminate()
-                server_process.join(timeout=3)
-                if server_process.is_alive():
-                    server_process.kill()
+                http.post(f'http://127.0.0.1:{port}/shutdown', timeout=2)
             except Exception as e:
                 print(f"Error stopping server: {e}")
-            finally:
-                server_process = None
-                running_server = False
+            server_thread.join(timeout=3)
+            server_thread = None
+            running_server = False
 
         # Clear connected devices
         connected_devices.clear()
@@ -385,14 +391,11 @@ if __name__ == '__main__':
     split_ipaddr = [int(num) for num in ipaddr.split('.')]
     base_ipaddr = str(split_ipaddr[0])
 
-    BaseManager.register('DeviceList', DeviceList)
-    manager = BaseManager()
-    manager.start()
-    connected_devices = manager.DeviceList()
-    server_timestamp = Value('d', 0)
+    connected_devices = DeviceList()
+    server_timestamp = 0.0
 
     running_server = False
-    server_process: Process = None
+    server_thread: Thread | None = None
 
     try:
         data_dir = os.path.join(os.getenv('LOCALAPPDATA'), APP_NAME)
