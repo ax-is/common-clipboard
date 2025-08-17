@@ -55,7 +55,6 @@ def register(address):
     try:
         hostname = gethostname()
         # Clean hostname to avoid issues with special characters and non-ASCII
-        import re
         # Remove or replace problematic characters
         hostname = re.sub(r'[^\w\-_.]', '_', hostname)
         # Limit length and ensure it's not empty
@@ -306,33 +305,40 @@ def edit_port():
     global running_server
     global server_process
 
-    # Stop the server first
-    if server_process is not None:
-        try:
-            server_process.terminate()
-            server_process.join(timeout=3)
-            if server_process.is_alive():
-                server_process.kill()
-        except Exception as e:
-            print(f"Error stopping server: {e}")
-        finally:
-            server_process = None
-            running_server = False
+    # Prevent multiple dialogs
+    if port_dialog_open.is_set():
+        return
+    port_dialog_open.set()
+    try:
+        # Stop the server first
+        if server_process is not None:
+            try:
+                server_process.terminate()
+                server_process.join(timeout=3)
+                if server_process.is_alive():
+                    server_process.kill()
+            except Exception as e:
+                print(f"Error stopping server: {e}")
+            finally:
+                server_process = None
+                running_server = False
 
-    # Clear connected devices
-    connected_devices.clear()
-    
-    # Show port dialog
-    port_dialog = PortEditor(port)
-    new_port = port_dialog.get_port()
-    
-    # Change port if user provided a new one
-    if new_port is not None and new_port != port:
-        port = new_port
-        print(f"Port changed to: {port}")
-    
-    # Restart server with new port
-    find_server()
+        # Clear connected devices
+        connected_devices.clear()
+
+        # Show port dialog
+        port_dialog = PortEditor(port)
+        new_port = port_dialog.get_port()
+
+        # Change port if user provided a new one
+        if new_port is not None and new_port != port:
+            port = new_port
+            print(f"Port changed to: {port}")
+
+        # Restart server with new port
+        find_server()
+    finally:
+        port_dialog_open.clear()
 
 
 def get_menu_items():
