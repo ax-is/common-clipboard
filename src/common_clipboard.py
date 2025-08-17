@@ -273,19 +273,72 @@ def close():
     sys.exit(0)
 
 
+def toggle_server():
+    """Toggle server on/off"""
+    global running_server
+    global server_process
+    global server_url
+    
+    if running_server:
+        # Stop server
+        if server_process is not None:
+            try:
+                server_process.terminate()
+                server_process.join(timeout=3)
+                if server_process.is_alive():
+                    server_process.kill()
+            except Exception as e:
+                print(f"Error stopping server: {e}")
+            finally:
+                server_process = None
+                running_server = False
+                server_url = ''
+                connected_devices.clear()
+                print("Server stopped")
+                systray.title = f'{APP_NAME}: Stopped'
+    else:
+        # Start server
+        find_server()
+
+
 def edit_port():
     global port
+    global running_server
+    global server_process
 
+    # Stop the server first
+    if server_process is not None:
+        try:
+            server_process.terminate()
+            server_process.join(timeout=3)
+            if server_process.is_alive():
+                server_process.kill()
+        except Exception as e:
+            print(f"Error stopping server: {e}")
+        finally:
+            server_process = None
+            running_server = False
+
+    # Clear connected devices
+    connected_devices.clear()
+    
+    # Show port dialog
     port_dialog = PortEditor(port)
-    new_port = port_dialog.port_number.get()
-    if port_dialog.applied and new_port != port:
+    new_port = port_dialog.get_port()
+    
+    # Change port if user provided a new one
+    if new_port is not None and new_port != port:
         port = new_port
-        find_server()
+        print(f"Port changed to: {port}")
+    
+    # Restart server with new port
+    find_server()
 
 
 def get_menu_items():
     menu_items = (
-        MenuItem(f'Port: {port}', Menu(MenuItem('Edit', lambda _: edit_port()))),
+        MenuItem('Stop Server' if running_server else 'Start Server', lambda _: toggle_server()),
+        MenuItem(f'Port: {port}', Menu(MenuItem('Edit', lambda _: Thread(target=edit_port, daemon=True).start()))),
         MenuItem('View Connected Devices', Menu(lambda: (
             MenuItem(f"{name} ({ip})", None) for ip, name in connected_devices.get_devices()
         ))) if running_server else None,
