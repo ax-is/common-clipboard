@@ -3,7 +3,6 @@ File to handle server operations
 """
 
 import time
-import ntplib
 from flask import Flask, request, make_response, send_file
 from io import BytesIO
 from device_list import DeviceList
@@ -76,12 +75,8 @@ def run_server(port, device_list, _unused_timestamp=None):
     global timestamp
     global connected_devices
 
-    try:
-        response = ntp_client.request('us.pool.ntp.org', version=3, timeout=5)
-        timestamp = response.tx_timestamp
-    except Exception as e:
-        print(f"Warning: Could not get NTP timestamp: {e}")
-        timestamp = time.time()
+    # Use local time for timestamp to avoid external dependencies
+    timestamp = time.time()
 
     connected_devices = device_list
 
@@ -89,8 +84,6 @@ def run_server(port, device_list, _unused_timestamp=None):
 
 
 unregistered_error = 'The requesting device is not registered to the server', 401
-
-ntp_client = ntplib.NTPClient()
 clipboard = b''
 data_type = 'text'
 timestamp = 0.0

@@ -73,6 +73,7 @@ def register(address):
 def test_server_ip(index):
     global server_url
     global running_server
+    global server_thread
 
     try:
         # Construct IP using our subnet and the provided index
@@ -83,10 +84,20 @@ def test_server_ip(index):
         try:
             response = http.get(tested_url + '/timestamp', timeout=2)
             if response.ok and float(response.text) < server_timestamp:
+                # If we find a suitable remote server, stop local server thread cleanly
+                try:
+                    if server_thread is not None and server_thread.is_alive():
+                        try:
+                            http.post(f'http://127.0.0.1:{port}/shutdown', timeout=2)
+                        except Exception:
+                            pass
+                        server_thread.join(timeout=3)
+                finally:
+                    server_thread = None
+                    running_server = False
+
                 server_url = tested_url
                 register(tested_ip)
-                running_server = False
-                # No child process now; server runs in-thread
                 systray.title = f'{APP_NAME}: Connected'
         except (ValueError, requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
             # Silently ignore connection errors during discovery
@@ -216,6 +227,7 @@ def detect_server_change():
 
 
 def mainloop():
+    last_menu_update = 0.0
     while run_app:
         try:
             if server_url:  # Only try to detect changes if we have a server URL
@@ -226,7 +238,10 @@ def mainloop():
                 find_server()
         finally:
             if running_server:
-                systray.update_menu()
+                now = time.time()
+                if now - last_menu_update >= 1.0:
+                    systray.update_menu()
+                    last_menu_update = now
             time.sleep(LISTENER_DELAY)
 
 
@@ -246,7 +261,6 @@ def start_server():
 
     # Launch Flask in a background thread
     def _run():
-        from server import run_server
         run_server(port, connected_devices, server_timestamp)
 
     server_thread = Thread(target=_run, daemon=True)
@@ -392,7 +406,7 @@ if __name__ == '__main__':
     base_ipaddr = str(split_ipaddr[0])
 
     connected_devices = DeviceList()
-    server_timestamp = 0.0
+    server_timestamp = time.time()
 
     running_server = False
     server_thread: Thread | None = None
