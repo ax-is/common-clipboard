@@ -23,6 +23,7 @@ from io import BytesIO
 from server import run_server
 from device_list import DeviceList
 from port_editor import PortEditor
+import winreg
 
 
 class Format(Enum):
@@ -267,6 +268,41 @@ def start_server():
     server_thread.start()
 
 
+# ---------------- Startup on Login (Windows) ----------------
+def _startup_reg_path():
+    return r"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+
+def is_startup_enabled():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _startup_reg_path(), 0, winreg.KEY_READ) as k:
+            try:
+                winreg.QueryValueEx(k, APP_NAME)
+                return True
+            except FileNotFoundError:
+                return False
+    except OSError:
+        return False
+
+
+def toggle_startup():
+    if not getattr(sys, 'frozen', False):
+        print("Startup toggle is available only in the packaged app.")
+        return
+    exe_path = sys.executable
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _startup_reg_path(), 0, winreg.KEY_ALL_ACCESS) as k:
+            if is_startup_enabled():
+                try:
+                    winreg.DeleteValue(k, APP_NAME)
+                except FileNotFoundError:
+                    pass
+            else:
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, f'"{exe_path}"')
+    except OSError as e:
+        print(f"Startup toggle error: {e}")
+
+
 def close():
     global run_app
 
@@ -361,10 +397,22 @@ def edit_port():
         port_dialog_open.clear()
 
 
+def toggle_dark_icon():
+    global use_dark_icon
+    use_dark_icon = not use_dark_icon
+    try:
+        new_icon = load_icon(use_dark_icon)
+        systray.icon = new_icon
+        systray.update_menu()
+    except Exception as e:
+        print(f"Icon toggle error: {e}")
+
+
 def get_menu_items():
     menu_items = (
         MenuItem('Stop Server' if running_server else 'Start Server', lambda _: toggle_server()),
         MenuItem(f'Port: {port}', Menu(MenuItem('Edit', lambda _: Thread(target=edit_port, daemon=True).start()))),
+        MenuItem('Start on Login: On' if is_startup_enabled() else 'Start on Login: Off', lambda _: toggle_startup()),
         MenuItem('View Connected Devices', Menu(lambda: (
             MenuItem(f"{name} ({ip})", None) for ip, name in connected_devices.get_devices()
         ))) if running_server else None,
@@ -432,24 +480,22 @@ if __name__ == '__main__':
     type_to_format = {v: k for k, v in format_to_type.items()}
 
     # Handle icon path for both development and PyInstaller executable
-    try:
-        # Try to find the icon file in the current directory
-        icon_path = 'systray_icon.ico'
-        if not os.path.exists(icon_path):
-            # If not found, try to get it from PyInstaller's temp directory
-            if getattr(sys, 'frozen', False):
-                # Running as PyInstaller executable
-                base_path = sys._MEIPASS
-                icon_path = os.path.join(base_path, 'systray_icon.ico')
-            else:
-                # Running as script, try relative to script location
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                icon_path = os.path.join(script_dir, 'systray_icon.ico')
-        
-        icon = Image.open(icon_path)
-    except (FileNotFoundError, OSError):
-        # Fallback: create a simple default icon
-        icon = Image.new('RGBA', (64, 64), (100, 100, 100, 255))
+    def load_icon():
+        try:
+            icon_name = 'systray_icon.ico'
+            icon_path = icon_name
+            if not os.path.exists(icon_path):
+                if getattr(sys, 'frozen', False):
+                    base_path = sys._MEIPASS
+                    icon_path = os.path.join(base_path, icon_name)
+                else:
+                    script_dir = os.path.dirname(os.path.abspath(__file__))
+                    icon_path = os.path.join(script_dir, icon_name)
+            return Image.open(icon_path)
+        except (FileNotFoundError, OSError):
+            return Image.new('RGBA', (64, 64), (100, 100, 100, 255))
+
+    icon = load_icon()
     
     systray = Icon(APP_NAME, icon=icon, title=APP_NAME, menu=Menu(get_menu_items))
     systray.run_detached()
