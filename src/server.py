@@ -2,6 +2,7 @@
 File to handle server operations
 """
 
+import time
 import ntplib
 from flask import Flask, request, make_response, send_file
 from io import BytesIO
@@ -11,9 +12,14 @@ from device_list import DeviceList
 app = Flask(__name__)
 
 
+
+
 @app.route('/timestamp', methods=['GET'])
 def get_timestamp():
     return str(timestamp.value), 200
+
+
+
 
 
 @app.route('/register', methods=['POST'])
@@ -71,10 +77,16 @@ def run_server(port, device_list, t):
     global timestamp
     global connected_devices
 
-    response = ntp_client.request('us.pool.ntp.org', version=3)
-    t.value = response.tx_timestamp
+    try:
+        response = ntp_client.request('us.pool.ntp.org', version=3, timeout=5)
+        t.value = response.tx_timestamp
+    except Exception as e:
+        print(f"Warning: Could not get NTP timestamp: {e}")
+        t.value = time.time()
+    
     timestamp = t
     connected_devices = device_list
+    
     app.run(host='0.0.0.0', port=port)
 
 

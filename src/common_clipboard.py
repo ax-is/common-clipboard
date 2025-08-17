@@ -8,6 +8,10 @@ import win32clipboard as clipboard
 import sys
 import os
 import pickle
+import re
+import socket
+import threading
+import msvcrt
 from socket import gethostbyname, gethostname, gaierror
 from threading import Thread
 from multiprocessing import freeze_support, Value, Process
@@ -24,6 +28,24 @@ from port_editor import PortEditor
 class Format(Enum):
     TEXT = clipboard.CF_UNICODETEXT
     IMAGE = clipboard.RegisterClipboardFormat('PNG')
+
+# Connection state management
+connection_lock = threading.Lock()
+
+# Global variables for single instance control
+instance_lock = None
+
+
+def check_single_instance():
+    """Check if another instance is already running"""
+    global instance_lock
+    try:
+        lock_file = os.path.join(os.getenv('TEMP', os.getcwd()), 'common_clipboard.lock')
+        instance_lock = open(lock_file, 'w')
+        msvcrt.locking(instance_lock.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except (IOError, OSError):
+        return False
 
 
 def register(address):
@@ -53,14 +75,29 @@ def test_server_ip(index):
         # Construct IP using our subnet and the provided index
         tested_ip = f'{split_ipaddr[0]}.{split_ipaddr[1]}.{split_ipaddr[2]}.{index}'
         tested_url = f'http://{tested_ip}:{port}'
-        response = requests.get(tested_url + '/timestamp', timeout=2)  # Reduced timeout
-        if response.ok and float(response.text) < server_timestamp.value:
-            register(tested_ip)
-            running_server = False
-            server_process.terminate()
-            systray.title = f'{APP_NAME}: Connected'
-    except (requests.exceptions.ConnectionError, AssertionError):
-        return
+        
+        # Test timestamp endpoint (original repository method)
+        try:
+            response = requests.get(tested_url + '/timestamp', timeout=2)
+            if response.ok and float(response.text) < server_timestamp.value:
+                server_url = tested_url
+                register(tested_ip)
+                running_server = False
+                try:
+                    server_process.terminate()
+                    server_process.join(timeout=2)
+                    if server_process.is_alive():
+                        server_process.kill()
+                except Exception as e:
+                    print(f"Error terminating server process: {e}")
+                systray.title = f'{APP_NAME}: Connected'
+        except (ValueError, requests.exceptions.ConnectionError, requests.exceptions.Timeout, Exception):
+            # Silently ignore connection errors during discovery
+            pass
+            
+    except Exception:
+        # Silently ignore connection errors during discovery
+        pass
 
 
 def generate_ips():
@@ -108,35 +145,63 @@ def detect_local_copy():
     global current_data
     global current_format
 
-    new_data, new_format = get_copied_data()
-    if new_data != current_data:
-        current_data = new_data
-        current_format = new_format
+    with connection_lock:
+        if not server_url:
+            return
 
-        file = BytesIO()
-        file.write(current_data.encode() if current_format == Format.TEXT else current_data)
-        file.seek(0)
-        requests.post(server_url + '/clipboard', data=file, headers={'Data-Type': format_to_type[current_format]})
+        new_data, new_format = get_copied_data()
+        if new_data != current_data:
+            current_data = new_data
+            current_format = new_format
+
+            file = None
+            try:
+                file = BytesIO()
+                file.write(current_data.encode() if current_format == Format.TEXT else current_data)
+                file.seek(0)
+                response = requests.post(server_url + '/clipboard', data=file, headers={'Data-Type': format_to_type[current_format]}, timeout=5)
+                if not response.ok:
+                    print(f"Failed to send clipboard data: {response.status_code}")
+            except Exception as e:
+                print(f"Error sending clipboard data: {e}")
+            finally:
+                if file:
+                    try:
+                        file.close()
+                    except:
+                        pass
 
 
 def detect_server_change():
     global current_data
     global current_format
 
-    headers = requests.head(server_url + '/clipboard', timeout=2)
-    if headers.ok and headers.headers['Data-Attached'] == 'True':
-        data_request = requests.get(server_url + '/clipboard')
-        data_format = type_to_format[data_request.headers['Data-Type']]
-        data = data_request.content.decode() if data_format == Format.TEXT else data_request.content
+    with connection_lock:
+        if not server_url:
+            return
 
         try:
-            clipboard.OpenClipboard()
-            clipboard.EmptyClipboard()
-            clipboard.SetClipboardData(data_format.value, data)
-            clipboard.CloseClipboard()
-            current_data, current_format = get_copied_data()
-        except BaseException:
-            return
+            headers = requests.head(server_url + '/clipboard', timeout=3)
+            if headers.ok and headers.headers.get('Data-Attached') == 'True':
+                data_request = requests.get(server_url + '/clipboard', timeout=5)
+                if data_request.ok:
+                    data_format = type_to_format[data_request.headers['Data-Type']]
+                    data = data_request.content.decode() if data_format == Format.TEXT else data_request.content
+
+                    try:
+                        clipboard.OpenClipboard()
+                        clipboard.EmptyClipboard()
+                        clipboard.SetClipboardData(data_format.value, data)
+                        clipboard.CloseClipboard()
+                        current_data, current_format = get_copied_data()
+                    except Exception as e:
+                        print(f"Error updating clipboard: {e}")
+                        try:
+                            clipboard.CloseClipboard()
+                        except:
+                            pass
+        except Exception as e:
+            print(f"Error checking server changes: {e}")
 
 
 def mainloop():
@@ -159,7 +224,15 @@ def start_server():
     global server_process
 
     if server_process is not None:
-        server_process.terminate()
+        try:
+            server_process.terminate()
+            server_process.join(timeout=3)
+            if server_process.is_alive():
+                server_process.kill()
+        except Exception as e:
+            print(f"Error terminating server process: {e}")
+        finally:
+            server_process = None
 
     connected_devices.clear()
     running_server = True
@@ -171,11 +244,30 @@ def close():
     global run_app
 
     run_app = False
+    
+    # Clean up server process
     if server_process is not None:
-        server_process.terminate()
+        try:
+            server_process.terminate()
+            server_process.join(timeout=3)
+            if server_process.is_alive():
+                server_process.kill()
+        except Exception as e:
+            print(f"Error terminating server process: {e}")
 
-    with open(preferences_file, 'wb') as save_file:
-        pickle.dump(port, save_file)
+    # Save preferences
+    try:
+        with open(preferences_file, 'wb') as save_file:
+            pickle.dump(port, save_file)
+    except Exception as e:
+        print(f"Error saving preferences: {e}")
+
+    # Clean up global variables
+    if instance_lock:
+        try:
+            instance_lock.close()
+        except:
+            pass
 
     systray.stop()
     sys.exit(0)
@@ -204,6 +296,11 @@ def get_menu_items():
 
 if __name__ == '__main__':
     freeze_support()
+
+    # Check for single instance
+    if not check_single_instance():
+        print("Another instance of Common Clipboard is already running.")
+        sys.exit(1)
 
     APP_NAME = 'Common Clipboard'
     LISTENER_DELAY = 0.3
@@ -282,4 +379,6 @@ if __name__ == '__main__':
     systray.run_detached()
 
     run_app = True
+    # Start server immediately instead of waiting for connection error
+    find_server()
     mainloop()
